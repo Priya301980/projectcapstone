@@ -8,7 +8,8 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
 RAW_DIR = ROOT / "data" / "raw"
-DATABASE_PATH = ROOT / "data" / "clean" / "instamart.db"
+CLEAN_DIR = ROOT / "data" / "clean"
+DATABASE_PATH = CLEAN_DIR / "instamart.db"
 
 
 def read_csv(name: str) -> pd.DataFrame:
@@ -26,11 +27,18 @@ def clean_customers() -> pd.DataFrame:
     ).dt.strftime("%Y-%m-%d")
 
     ages = pd.to_numeric(customers["age"], errors="coerce")
-    customers["age"] = ages.where(ages.between(18, 100)).astype("Int64")
+    customers["age"] = ages.where(ages.between(10, 100))
+    city_medians = customers.groupby("city")["age"].transform("median")
+    customers["age"] = customers["age"].fillna(city_medians)
+    if customers["age"].isna().any():
+        customers["age"] = customers["age"].fillna(customers["age"].median())
+    if customers["age"].isna().any():
+        raise ValueError("Cannot impute customer ages: no valid ages were found.")
+    customers["age"] = customers["age"].round().astype(int)
     genders = customers["gender"].str.lower()
     customers["gender"] = genders.map(
-        {"m": "Male", "male": "Male", "f": "Female", "female": "Female"}
-    )
+        {"m": "male", "male": "male", "f": "female", "female": "female"}
+    ).fillna("unknown")
 
     customers = customers.dropna(subset=["customer_id", "city", "signup_date"])
     return customers.drop_duplicates(subset=["customer_id"], keep="first").reset_index(
@@ -91,9 +99,19 @@ def clean_orders(products: pd.DataFrame, customers: pd.DataFrame) -> pd.DataFram
     orders.loc[invalid_amount, "order_amount"] = expected_amount[invalid_amount]
 
     orders.loc[orders["delivery_minutes"] < 0, "delivery_minutes"] = pd.NA
+    categories = products.set_index("product_id")["category"]
+    orders["_category"] = orders["product_id"].map(categories)
+    completed = orders["status"].eq("completed")
+    category_medians = orders.loc[completed].groupby("_category")[
+        "delivery_minutes"
+    ].median()
+    missing_delivery = completed & orders["delivery_minutes"].isna()
+    orders.loc[missing_delivery, "delivery_minutes"] = orders.loc[
+        missing_delivery, "_category"
+    ].map(category_medians)
     orders["quantity"] = orders["quantity"].astype("Int64")
     orders["discount_pct"] = orders["discount_pct"].astype("Int64")
-    orders["delivery_minutes"] = orders["delivery_minutes"].astype("Int64")
+    orders["delivery_minutes"] = orders["delivery_minutes"].round().astype("Int64")
     orders["order_ts"] = orders["order_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
     return orders[
         [
@@ -148,8 +166,10 @@ def load_database(
                 customer_id TEXT PRIMARY KEY,
                 city TEXT NOT NULL,
                 signup_date TEXT NOT NULL,
-                age INTEGER CHECK (age IS NULL OR age BETWEEN 18 AND 100),
-                gender TEXT CHECK (gender IS NULL OR gender IN ('Male', 'Female'))
+                age INTEGER NOT NULL CHECK (age BETWEEN 10 AND 100),
+                gender TEXT NOT NULL CHECK (
+                    gender IN ('male', 'female', 'unknown')
+                )
             )
             """
         )
@@ -190,12 +210,23 @@ def load_database(
             raise sqlite3.IntegrityError(f"Foreign key violations: {violations}")
 
 
+def save_clean_csvs(
+    customers: pd.DataFrame, products: pd.DataFrame, orders: pd.DataFrame
+) -> None:
+    CLEAN_DIR.mkdir(parents=True, exist_ok=True)
+    customers.to_csv(CLEAN_DIR / "customers.csv", index=False)
+    products.to_csv(CLEAN_DIR / "products.csv", index=False)
+    orders.to_csv(CLEAN_DIR / "orders.csv", index=False)
+
+
 def main() -> None:
     customers = clean_customers()
     products = clean_products()
     orders = clean_orders(products, customers)
+    save_clean_csvs(customers, products, orders)
     load_database(customers, products, orders)
     print(f"SQLite database: {DATABASE_PATH}")
+    print(f"Cleaned CSV files: {CLEAN_DIR}")
     print(
         "Loaded rows: "
         f"customers={len(customers)}, products={len(products)}, orders={len(orders)}"
